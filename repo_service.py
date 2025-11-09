@@ -92,6 +92,7 @@ class RepoService:
             )
         else:
             self.set_up()
+            self.fetch_github_metadata()
 
     def check_if_exist(self):
         repo_info_path = os.path.join(self.repo_path, "repo_info.json")
@@ -222,6 +223,7 @@ class RepoService:
 
             # after updating the repository, get the latest stats
             self.get_repo_stats()
+            self.fetch_github_metadata()
             return True
         except (GitCommandError, NoSuchPathError, InvalidGitRepositoryError) as e:
             logger.error(f"Failed to update repository {self.repo_name}: {e}")
@@ -237,6 +239,64 @@ class RepoService:
                 f"Repository {self.repo_name} does not exist at {self.repo_path}"
             )
             return False
+
+    def fetch_github_metadata(self, token=None):
+        """Fetch commits, issues, and PRs from GitHub API and store them."""
+        if "github.com" not in self.repo_url:
+            logger.warning("Only GitHub repositories are supported for metadata fetch.")
+            return
+
+        repo_full_name = self.repo_url.split("github.com/")[-1].replace(".git", "")
+        headers = {"Accept": "application/vnd.github+json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        base_url = f"https://api.github.com/repos/{repo_full_name}"
+
+        # 1️⃣ Fetch commits
+        commits = requests.get(f"{base_url}/commits", headers=headers).json()
+        with open(os.path.join(self.repo_path, "commits.json"), "w") as f:
+            json.dump(commits, f, indent=2)
+
+        # 2️⃣ Fetch issues
+        issues = requests.get(f"{base_url}/issues?state=all", headers=headers).json()
+        with open(os.path.join(self.repo_path, "issues.json"), "w") as f:
+            json.dump(issues, f, indent=2)
+
+        # 3️⃣ Fetch pull requests
+        prs = requests.get(f"{base_url}/pulls?state=all", headers=headers).json()
+        with open(os.path.join(self.repo_path, "pull_requests.json"), "w") as f:
+            json.dump(prs, f, indent=2)
+
+        logger.info(f"Fetched metadata for {self.repo_name}: commits, issues, PRs")
+
+    def get_metadata_summary(self, limit=None):
+        """Combine commits, issues, and PR summaries into plain text."""
+        text = ""
+        for file_name in ["commits.json", "issues.json", "pull_requests.json"]:
+            path = os.path.join(self.repo_path, file_name)
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    data = json.load(f)
+                text += f"\n\n== {file_name.upper()} ==\n"
+                for entry in data[:10]:  # limit to top N
+                    if "title" in entry:
+                        text += f"Title: {entry['title']}\n"
+                    if "body" in entry and entry["body"]:
+                        text += f"Body: {entry['body'][:300]}...\n"
+                    if "commit" in entry:
+                        text += f"Commit: {entry['commit']['message'][:300]}...\n"
+                    text += "-" * 40 + "\n"
+                    if limit and num_tokens_from_string(text) > limit:
+                        break
+        diff_dir = os.path.join(self.repo_path, "pr_diffs")
+        if os.path.exists(diff_dir):
+            for diff_file in sorted(os.listdir(diff_dir))[:3]:  # top 3 diffs
+                with open(os.path.join(diff_dir, diff_file)) as f:
+                    diff_content = f.read()
+                    text += f"\n\n== {diff_file} ==\n```diff\n{diff_content[:2000]}\n```"
+        return text.strip()
+
 
     def get_repo_stats(self):
         data = []

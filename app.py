@@ -98,7 +98,7 @@ def create_app():
             "deepseek/deepseek-chat",
             "zhipu/glm-4",
             "ollama/llama2",
-            "groq/llama-3.1-70b-versatile",
+            "groq/llama-3.3-70b-versatile",
             "claude-3-5-sonnet-20240620",
         ]
 
@@ -181,6 +181,9 @@ def create_app():
             selected_languages=selected_languages,
             limit=limit,
         )
+        metadata_string = repo.get_metadata_summary(limit=limit)
+        file_string += "\n\n=== Repository Metadata ===\n" + metadata_string
+
         end_time = pd.Timestamp.now()
         logger.info(f"Time taken to get filtered files: {end_time - start_time}")
 
