@@ -7,7 +7,7 @@ This is an example of building a chatbot for GitHub repo using streamlit, GaiaNe
 1. Clone the repository and install the dependencies
 
 ```shell
-git clone https://github.com/Hizeros/chat2repo
+git clone https://github.com/jinangshah21/chat2repo
 ```
 
 2. Install the dependencies
