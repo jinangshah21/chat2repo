@@ -3,6 +3,7 @@ import os
 import subprocess
 import time
 import zipfile
+import re
 from functools import wraps
 
 import nbformat
@@ -15,6 +16,8 @@ from pygments.lexers import TextLexer, guess_lexer_for_filename
 from pygments.util import ClassNotFound
 from send2trash import send2trash
 from token_count import num_tokens_from_string
+from embedding_service import EmbeddingManager
+from parser import run_parser
 
 
 def convert_ipynb_to_text(ipynb_content):
@@ -78,13 +81,16 @@ def retry(max_retries=3, retry_delay=5):
 
 
 class RepoService:
-    def __init__(self, repo_url, repo_name=None):
+    def __init__(self, repo_url, repo_name=None, github_token=None, api_key=None):
         self.repo_url = repo_url
         self.repo_name = (
             repo_name if repo_name else repo_url.split("/")[-1].replace(".git", "")
         )
         self.repo_path = os.path.join(Config["repos_dir"], self.repo_name)
         self.clone_path = os.path.join(self.repo_path, self.repo_name + "-main")
+        self.embedder = EmbeddingManager(self.repo_path)
+        self.github_token = github_token
+        self.api_key = api_key
 
         if self.check_if_exist():
             logger.info(
@@ -92,7 +98,8 @@ class RepoService:
             )
         else:
             self.set_up()
-            self.fetch_github_metadata()
+            run_parser(self.repo_path, self.api_key)
+            self.fetch_github_metadata(token=self.github_token)
 
     def check_if_exist(self):
         repo_info_path = os.path.join(self.repo_path, "repo_info.json")
@@ -212,7 +219,6 @@ class RepoService:
             current_commit = repo.head.commit  # get the current commit
             # get the remote commit
             remote_commit = origin.refs[repo.active_branch.name].commit
-
             if current_commit.hexsha == remote_commit.hexsha:
                 logger.info(f"Repository {self.repo_name} is already up-to-date.")
                 return True  # if the current commit is the same as the remote commit, the repository is up-to-date # noqa
@@ -223,7 +229,8 @@ class RepoService:
 
             # after updating the repository, get the latest stats
             self.get_repo_stats()
-            self.fetch_github_metadata()
+            run_parser(self.repo_path, self.api_key)
+            self.fetch_github_metadata(token=self.github_token)
             return True
         except (GitCommandError, NoSuchPathError, InvalidGitRepositoryError) as e:
             logger.error(f"Failed to update repository {self.repo_name}: {e}")
@@ -240,8 +247,31 @@ class RepoService:
             )
             return False
 
+    def fetch_with_retry(self, url, headers, max_retries=3, delay=2):
+        """Helper to safely fetch from GitHub API with retries and JSON validation."""
+        for attempt in range(int(max_retries)):
+            try:
+                response = requests.get(url, headers=headers, timeout=20)
+                if response.status_code == 403 and "X-RateLimit-Remaining" in response.headers:
+                    reset_time = int(response.headers.get("X-RateLimit-Reset", time.time() + 60))
+                    wait_for = max(0, reset_time - time.time())
+                    logger.warning(f"Rate limited. Waiting {int(wait_for)}s before retry...")
+                    time.sleep(wait_for + 1)
+                    continue
+                response.raise_for_status()
+                data = response.json()
+                if isinstance(data, (dict, list)):
+                    return data
+                else:
+                    logger.warning(f"Unexpected JSON format from {url}: {data}")
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
+                time.sleep(delay)
+        logger.error(f"Failed to fetch valid JSON after {max_retries} attempts: {url}")
+        return []
+
     def fetch_github_metadata(self, token=None):
-        """Fetch commits, issues, and PRs from GitHub API and store them."""
+        """Fetch compact commits, issues, and PR metadata for embeddings with safe error handling."""
         if "github.com" not in self.repo_url:
             logger.warning("Only GitHub repositories are supported for metadata fetch.")
             return
@@ -252,49 +282,185 @@ class RepoService:
             headers["Authorization"] = f"Bearer {token}"
 
         base_url = f"https://api.github.com/repos/{repo_full_name}"
+        os.makedirs(self.repo_path, exist_ok=True)
 
-        # 1️⃣ Fetch commits
-        commits = requests.get(f"{base_url}/commits", headers=headers).json()
+        # === Fetch Commits ===
+        logger.info(f"Fetching commits for {repo_full_name}")
+        commits_raw = self.fetch_with_retry(f"{base_url}/commits?per_page=100", headers)
+        commits = []
+        commit_diff_dir = os.path.join(self.repo_path, "commit_diffs")
+        os.makedirs(commit_diff_dir, exist_ok=True)
+        
+        for c in commits_raw if isinstance(commits_raw, list) else []:
+            if not isinstance(c, dict):
+                continue
+            commit_data = {
+                "sha": c.get("sha"),
+                "author": c.get("commit", {}).get("author", {}).get("name"),
+                "date": c.get("commit", {}).get("author", {}).get("date"),
+                "message": c.get("commit", {}).get("message"),
+                "url": c.get("html_url"),
+            }
+            commits.append(commit_data)
+
+            # === Download commit diff ===
+            sha = c.get("sha")
+            if sha:
+                diff_url = f"https://github.com/{repo_full_name}/commit/{sha}.diff"
+                try:
+                    resp = requests.get(diff_url, headers=headers)
+                    if resp.status_code == 200 and resp.text.strip():
+                        diff_path = os.path.join(commit_diff_dir, f"{sha}.diff")
+                        with open(diff_path, "w") as df:
+                            df.write(resp.text)
+                        logger.debug(f"Saved diff for commit {sha[:7]}")
+                    else:
+                        logger.warning(f"Empty or failed diff fetch for commit {sha[:7]}")
+                except Exception as e:
+                    logger.error(f"Error fetching diff for commit {sha[:7]}: {e}")
+
         with open(os.path.join(self.repo_path, "commits.json"), "w") as f:
             json.dump(commits, f, indent=2)
 
-        # 2️⃣ Fetch issues
-        issues = requests.get(f"{base_url}/issues?state=all", headers=headers).json()
+        # === Fetch Issues ===
+        logger.info(f"Fetching issues for {repo_full_name}")
+        issues_raw = self.fetch_with_retry(f"{base_url}/issues?state=all&per_page=100", headers)
+        issues = []
+        for i in issues_raw if isinstance(issues_raw, list) else []:
+            if not isinstance(i, dict) or "pull_request" in i:
+                continue
+            issue_data = {
+                "id": i.get("id"),
+                "number": i.get("number"),
+                "title": i.get("title"),
+                "body": i.get("body"),
+                "state": i.get("state"),
+                "user": i.get("user", {}).get("login"),
+                "labels": [l.get("name") for l in i.get("labels", []) if isinstance(l, dict)],
+                "created_at": i.get("created_at"),
+                "updated_at": i.get("updated_at"),
+                "comments_url": i.get("comments_url"),
+            }
+            issues.append(issue_data)
+
         with open(os.path.join(self.repo_path, "issues.json"), "w") as f:
             json.dump(issues, f, indent=2)
 
-        # 3️⃣ Fetch pull requests
-        prs = requests.get(f"{base_url}/pulls?state=all", headers=headers).json()
+        # === Fetch Pull Requests ===
+        logger.info(f"Fetching pull requests for {repo_full_name}")
+        prs_raw = self.fetch_with_retry(f"{base_url}/pulls?state=all&per_page=50", headers)
+        prs = []
+        commit_to_pr = {}
+
+        for pr in prs_raw if isinstance(prs_raw, list) else []:
+            if not isinstance(pr, dict):
+                continue
+
+            pr_number = pr.get("number")
+            if not pr_number:
+                continue
+            pr_url = f"{base_url}/pulls/{pr_number}"
+
+            # fetch full PR details
+            pr_detail = self.fetch_with_retry(pr_url, headers)
+            if not isinstance(pr_detail, dict):
+                logger.warning(f"Invalid PR detail for #{pr_number}: {pr_detail}")
+                continue
+
+             # fetch commits for this PR
+            commits_url = pr_detail.get("commits_url")
+            if commits_url:
+                pr_commits = self.fetch_with_retry(commits_url, headers)
+                if isinstance(pr_commits, list):
+                    for c in pr_commits:
+                        sha = c.get("sha")
+                        if sha:
+                            commit_to_pr[sha] = pr_number
+
+            # fetch files for this PR
+            files_url = f"{pr_url}/files"
+            pr_files = self.fetch_with_retry(files_url, headers)
+
+            simplified_files = []
+            if isinstance(pr_files, list):
+                for f in pr_files:
+                    if not isinstance(f, dict):
+                        continue
+                    simplified_files.append({
+                        "filename": f.get("filename"),
+                        "status": f.get("status"),
+                        "additions": f.get("additions"),
+                        "deletions": f.get("deletions"),
+                        "patch": f.get("patch", "")[:2000],  # truncate long diffs
+                    })
+            else:
+                logger.warning(f"PR #{pr_number} files API returned non-list: {pr_files}")
+
+            # Extract linked issues from PR body
+            linked_issues = self._extract_linked_issues(pr_detail.get("body", ""))
+
+            prs.append({
+                "number": pr_number,
+                "title": pr_detail.get("title"),
+                "body": pr_detail.get("body"),
+                "state": pr_detail.get("state"),
+                "created_at": pr_detail.get("created_at"),
+                "updated_at": pr_detail.get("updated_at"),
+                "user": pr_detail.get("user", {}).get("login"),
+                "linked_issues": linked_issues,
+                "base": pr_detail.get("base", {}).get("ref"),
+                "head": pr_detail.get("head", {}).get("ref"),
+                "files": simplified_files,
+            })
+
         with open(os.path.join(self.repo_path, "pull_requests.json"), "w") as f:
             json.dump(prs, f, indent=2)
 
-        logger.info(f"Fetched metadata for {self.repo_name}: commits, issues, PRs")
+        logger.info(f"Fetched and simplified metadata for {self.repo_name}")
+        self.embedder.build_embeddings(commit_to_pr)
+
+    def _extract_linked_issues(self, text):
+        """Extract issue references like 'Fixes #12' or 'Closes #45'."""
+        if not text:
+            return []
+        matches = re.findall(r"(?:Fixes|Closes|Resolves)\s+#(\d+)", text, flags=re.IGNORECASE)
+        return [f"#{m}" for m in matches]
 
     def get_metadata_summary(self, limit=None):
-        """Combine commits, issues, and PR summaries into plain text."""
+        """Return a textual summary of cleaned commits, issues, and PRs."""
         text = ""
         for file_name in ["commits.json", "issues.json", "pull_requests.json"]:
             path = os.path.join(self.repo_path, file_name)
-            if os.path.exists(path):
-                with open(path, "r") as f:
-                    data = json.load(f)
-                text += f"\n\n== {file_name.upper()} ==\n"
-                for entry in data[:10]:  # limit to top N
-                    if "title" in entry:
-                        text += f"Title: {entry['title']}\n"
-                    if "body" in entry and entry["body"]:
-                        text += f"Body: {entry['body'][:300]}...\n"
-                    if "commit" in entry:
-                        text += f"Commit: {entry['commit']['message'][:300]}...\n"
-                    text += "-" * 40 + "\n"
-                    if limit and num_tokens_from_string(text) > limit:
-                        break
+            if not os.path.exists(path):
+                continue
+            with open(path, "r") as f:
+                data = json.load(f)
+
+            text += f"\n\n== {file_name.upper()} ==\n"
+            for entry in data[:10]:
+                if "number" in entry:
+                    text += f"Number: {entry['number']}\n"
+                if "title" in entry:
+                    text += f"Title: {entry['title']}\n"
+                if "body" in entry and entry["body"]:
+                    text += f"Body: {entry['body'][:300]}...\n"
+                if "message" in entry:  # for commits
+                    text += f"Commit: {entry['message'][:300]}...\n"
+                if "files" in entry:
+                    text += f"Files: {[f['filename'] for f in entry['files']][:3]}\n"
+                text += "-" * 40 + "\n"
+
+                if limit and num_tokens_from_string(text) > limit:
+                    break
+
+        # Append top PR diffs (optional)
         diff_dir = os.path.join(self.repo_path, "pr_diffs")
         if os.path.exists(diff_dir):
-            for diff_file in sorted(os.listdir(diff_dir))[:3]:  # top 3 diffs
+            for diff_file in sorted(os.listdir(diff_dir))[:3]:
                 with open(os.path.join(diff_dir, diff_file)) as f:
                     diff_content = f.read()
-                    text += f"\n\n== {diff_file} ==\n```diff\n{diff_content[:2000]}\n```"
+                    text += f"\n\n== {diff_file} ==\n```diff\n{diff_content[:1500]}\n```"
+
         return text.strip()
 
 
@@ -545,6 +711,22 @@ class RepoService:
         df = pd.read_csv(csv_path)
         languages = df["language"].dropna().unique()
         return sorted(languages)
+    
+    def review_pr(self, pr_number, top_k_params=None):
+        embed_mgr = EmbeddingManager(self.repo_path)
+        context = embed_mgr.retrieve_pr_context(pr_number, params={"top_k": top_k_params or {}})
+        output_dir = os.path.join(self.repo_path, "pr_review_context")
+        os.makedirs(output_dir, exist_ok=True)
+        fp = os.path.join(output_dir, f"pr_{pr_number}.json")
+
+        try:
+            with open(fp, "w") as jf:
+                json.dump(context, jf, indent=2)
+            logger.info(f"[PR_CONTEXT] Saved PR #{pr_number} context to: {fp}")
+        except Exception as e:
+            logger.error(f"Failed to write PR context for #{pr_number}: {e}")
+
+        return context
 
 
 def singleton(cls):
@@ -560,12 +742,14 @@ def singleton(cls):
 
 @singleton
 class RepoManager:
-    def __init__(self):
+    def __init__(self, github_token=None, api_key=None):
         logger.info("Initializing RepoManager...")
         self.repos = {}
         # if no repo dir
         if not os.path.exists(Config["repos_dir"]):
             os.makedirs(Config["repos_dir"], exist_ok=True)
+        self.github_token = github_token
+        self.api_key = api_key
         self.load_repos()
         logger.info(f"Loaded {len(self.repos)} repositories.")
 
@@ -624,11 +808,11 @@ class RepoManager:
         for repo in repo_details:
             repo_url = repo["repo_url"]
             repo_name = repo["repo_name"]
-            self.repos[repo_url] = RepoService(repo_url=repo_url, repo_name=repo_name)
+            self.repos[repo_url] = RepoService(repo_url=repo_url, repo_name=repo_name, github_token=self.github_token, api_key=self.api_key)
 
     def add_repo(self, repo_url):
         if repo_url not in self.repos:
-            repo_service = RepoService(repo_url=repo_url)
+            repo_service = RepoService(repo_url=repo_url, github_token=self.github_token, api_key=self.api_key)
             if repo_service.check_if_exist():
                 self.repos[repo_url] = repo_service
                 logger.info(f"Added repository: {repo_url}")
